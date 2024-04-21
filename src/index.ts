@@ -1,32 +1,55 @@
-/**
- * Welcome to Cloudflare Workers! This is your first worker.
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your worker in action
- * - Run `npm run deploy` to publish your worker
- *
- * Learn more at https://developers.cloudflare.com/workers/
- */
+import { Scraper } from '@the-convocation/twitter-scraper';
 
-export interface Env {
-	// Example binding to KV. Learn more at https://developers.cloudflare.com/workers/runtime-apis/kv/
-	// MY_KV_NAMESPACE: KVNamespace;
-	//
-	// Example binding to Durable Object. Learn more at https://developers.cloudflare.com/workers/runtime-apis/durable-objects/
-	// MY_DURABLE_OBJECT: DurableObjectNamespace;
-	//
-	// Example binding to R2. Learn more at https://developers.cloudflare.com/workers/runtime-apis/r2/
-	// MY_BUCKET: R2Bucket;
-	//
-	// Example binding to a Service. Learn more at https://developers.cloudflare.com/workers/runtime-apis/service-bindings/
-	// MY_SERVICE: Fetcher;
-	//
-	// Example binding to a Queue. Learn more at https://developers.cloudflare.com/queues/javascript-apis/
-	// MY_QUEUE: Queue;
-}
+const scraper = new Scraper({
+	fetch: fetch,
+});
+
+type FetchStatsQueueMessage = {
+	username: string;
+};
+
+type NewUserQueueMessage = {
+	username: string;
+};
 
 export default {
-	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-		return new Response('Hello World!');
+	async scheduled(event: ScheduledEvent, env: CloudflareEnv, ctx: ExecutionContext) {
+		// Fetch all the users we're tracking
+		const { results: users } = await env.DATABASE.prepare('SELECT username FROM users').all<{ username: string }>();
+
+		// If there are no users, return
+		if (users.length === 0) {
+			console.info('No users to fetch stats for');
+			return;
+		}
+
+		// Queue a fetch stats job for each user
+		for (const user of users) {
+			await env.QUEUE.send({
+				username: user.username,
+			});
+		}
+	},
+	async queue(batch: MessageBatch<FetchStatsQueueMessage | NewUserQueueMessage>, env: CloudflareEnv): Promise<void> {
+		console.info('Processing queue', batch.queue, batch.messages.length);
+
+		switch (batch.queue) {
+			case 'stats':
+				// Fetch the stats for each user
+				for (const message of batch.messages) {
+					// Fetch the user's profile
+					const profile = await scraper.getProfile(message.body.username);
+
+					// Save the stats to D1
+					await env.DATABASE.prepare('INSERT INTO stats (user_id, followers, following, tweets) VALUES (?, ?, ?, ?)')
+						.bind(profile.userId, profile.followersCount, profile.followingCount, profile.tweetsCount)
+						.run();
+				}
+				break;
+			default:
+				throw new Error(`Unknown queue: ${batch.queue}`);
+		}
+
+		console.info('Finished processing queue', batch.queue);
 	},
 };
